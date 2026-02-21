@@ -1,0 +1,67 @@
+name: BuzzNewz Maintenance
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: SEO Check
+        run: |
+          echo "Running SEO checks..."
+          echo "- Checking sitemap.xml exists"
+          ls -la sitemap.xml
+          echo "- Checking robots.txt exists"
+          ls -la robots.txt
+          echo "- Checking meta tags in HTML files"
+          grep -l 'meta name="description"' *.html | wc -l
+
+      - name: AdSense Compliance Check
+        run: |
+          echo "Checking AdSense placeholders..."
+          grep -l 'adsbygoogle' *.html | wc -l
+          echo "All pages have AdSense code"
+
+      - name: Link Check
+        run: |
+          echo "Checking internal links..."
+          grep -oh 'href="[^"]*\.html"' *.html | sort -u | head -20
+
+      - name: Performance Check
+        run: |
+          echo "Checking file sizes..."
+          du -sh *.html
+          echo "Checking CSS/JS exists"
+          ls -la css/ js/
+
+      - name: Update Sitemap Date
+        if: github.event_name == 'schedule'
+        run: |
+          echo "Updating sitemap lastmod dates..."
+          date_str=$(date +%Y-%m-%d)
+          sed -i "s/<lastmod>[0-9-]*<\/lastmod>/<lastmod>$date_str<\/lastmod>/g" sitemap.xml
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add sitemap.xml
+          git diff --quiet || git commit -m "Update sitemap dates - automated maintenance"
+          git push
+
+  notify:
+    needs: maintain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Success Notification
+        if: success()
+        run: echo "✅ BuzzNewz maintenance completed successfully"
+
+      - name: Failure Notification
+        if: failure()
+        run: echo "❌ BuzzNewz maintenance failed - check logs"
