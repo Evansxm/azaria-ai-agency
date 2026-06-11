@@ -8,9 +8,12 @@ mode = "smart"
 
 workers_dev = true
 
+[[kv_namespaces]]
+binding = "AZARIA_KV"
+id = "c5e138ac78634ce4802de4171941b4a9"
+
 [env.production]
 name = "azaria-ai-worker"
-route = { pattern = "azaria-ai-worker.evansmathibe82.workers.dev", custom_domain = true }
 
 [env.preview]
 name = "azaria-ai-worker-preview"
