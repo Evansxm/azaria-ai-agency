@@ -1,0 +1,23 @@
+name = "azaria-ai-worker"
+main = "src/worker.js"
+compatibility_date = "2024-12-18"
+compatibility_flags = ["nodejs_compat"]
+
+[placement]
+mode = "smart"
+
+workers_dev = true
+
+[env.production]
+name = "azaria-ai-worker"
+route = { pattern = "azaria-ai-worker.evansmathibe82.workers.dev", custom_domain = true }
+
+[env.preview]
+name = "azaria-ai-worker-preview"
+
+[triggers]
+crons = ["0 6 * * *"]
+
+[observability]
+enabled = true
+head_sampling_rate = 0.1

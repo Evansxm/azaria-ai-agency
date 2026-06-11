@@ -1,0 +1,6 @@
+# Cloudflare Pages redirects
+# Old BuzzNewz paths → Azaria AI
+/buzznewz/*  https://production.azaria-ai-frontend.pages.dev/:splat  301
+
+# Security: force HTTPS
+*  https://production.azaria-ai-frontend.pages.dev/:splat  301

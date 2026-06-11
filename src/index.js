@@ -7,7 +7,7 @@ import {
 import { Octokit } from 'octokit';
 
 const GITHUB_OWNER = 'Evansxm';
-const GITHUB_REPO = 'buzznewz';
+const GITHUB_REPO = 'azaria-ai-agency';
 
 const server = new Server(
   {

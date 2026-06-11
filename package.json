@@ -1,20 +1,25 @@
 {
-  "name": "buzznewz-mcp",
+  "name": "azaria-ai-agency",
   "version": "1.0.0",
-  "description": "MCP Server for BuzzNewz Landing Page - Google Ads Management & Maintenance",
+  "description": "Azaria AI Agency - MCP Server & Cloudflare Worker for site management, analytics, and maintenance",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
-    "build": "next build",
+    "dev": "node src/index.js",
     "start": "node src/index.js",
+    "build": "next build",
+    "worker:dev": "wrangler dev src/index.js --local",
+    "worker:deploy": "wrangler deploy",
+    "worker:tail": "wrangler tail",
+    "pages:dev": "npx @cloudflare/next-on-pages",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
   },
   "keywords": [
     "mcp",
-    "buzznewz",
-    "google-ads",
-    "adsense",
-    "landing-page"
+    "azaria-ai",
+    "cloudflare",
+    "workers",
+    "ai-agency"
   ],
   "author": "Evans Mathibe",
   "license": "MIT",
@@ -28,6 +33,7 @@
   "devDependencies": {
     "next": "^16.2.9",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "wrangler": "^4.0.0"
   }
 }
