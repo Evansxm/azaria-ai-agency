@@ -294,9 +294,11 @@ export default {
     }
 
     if (request.method === 'GET' && url.pathname === '/') {
-      if (!server) await initServer();
       return jsonResponse({
-        service: 'Azaria AI Worker',
+        status: 'ONLINE_AND_ACTIVE',
+        system: 'Evans Mathibe AI Platform Engine',
+        gateway_protocol: 'JSON-RPC 2.0 Over HTTPS',
+        timestamp: new Date().toISOString(),
         version: '1.0.0',
         endpoints: {
           health: '/health',
