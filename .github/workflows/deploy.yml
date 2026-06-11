@@ -1,0 +1,42 @@
+name: Evans Mathibe AI Cloud Build Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Clone Repository State
+        uses: actions/checkout@v4
+
+      - name: 🟢 Install Node.js Operational Run-times
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: 📦 Restore Code Modules & Dependencies
+        run: npm ci
+
+      - name: ⚙️ Deploy Serverless Edge Worker Gateway
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy src/worker.js --name=azaria-ai-worker
+
+      - name: 🎨 Compile Throttled Low-Resource Frontend Application
+        env:
+          NODE_ENV: production
+          NODE_OPTIONS: "--max-old-space-size=3072"
+        run: npm run build
+
+      - name: 🌐 Push Pristine UI Matrix to Cloudflare Pages CDN
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy public --project-name=azaria-ai-frontend
