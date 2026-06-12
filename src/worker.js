@@ -5,14 +5,23 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { Octokit } from 'octokit';
 import { hashPII, stripPII } from './crypto.js';
+import {
+  createTenant, getTenant, listTenants, updateTenantLimits, deactivateTenant,
+  recordUsage, getUsage, getAllUsageSummary, checkUsageLimit,
+  createIntegration, getIntegrations, deleteIntegration,
+  storeToken, validateToken,
+  storeBYOK, getBYOKs, deleteBYOK,
+  createSubscription, getSubscription,
+} from './tenant-kv.js';
 
 const GITHUB_OWNER = 'Evansxm';
 const GITHUB_REPO = 'azaria-ai-agency';
 const COMPLIANCE_CONTACT_EMAIL = 'evans.mathibe@mail.com';
 const TOOLS_RATE_LIMIT = 5;
 const TOOLS_RATE_WINDOW = 60;
-const MASTER_ADMIN_HASH = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
-const WORKER_VERSION = '1.0.0';
+const WORKER_VERSION = '1.1.0';
+const TIMEOUT_MS = 30000;
+const BYOK_PROVIDERS = ['openai', 'anthropic', 'gemini', 'groq', 'together'];
 
 function getClientIP(request) {
   return request.headers.get('CF-Connecting-IP')
@@ -45,13 +54,6 @@ async function checkRateLimit(kv, ipHash) {
   return { allowed: true, remaining: TOOLS_RATE_LIMIT - entry.count };
 }
 
-async function validateBearerToken(kv, token) {
-  if (!token) return null;
-  const tokenHash = await sha256Hex(token);
-  const record = await kv.get(`token:${tokenHash}`, 'json');
-  return record || null;
-}
-
 const tools = [
   {
     name: 'get_site_status',
@@ -75,8 +77,7 @@ const tools = [
       type: 'object',
       properties: {
         publisherId: { type: 'string', description: 'Your AdSense Publisher ID (e.g., ca-pub-123456789)' },
-      },
-      required: ['publisherId'],
+      }, required: ['publisherId'],
     },
   },
   {
@@ -89,8 +90,7 @@ const tools = [
         content: { type: 'string', description: 'Article content in HTML' },
         category: { type: 'string', description: 'Article category' },
         excerpt: { type: 'string', description: 'Article excerpt/summary' },
-      },
-      required: ['title', 'content', 'category'],
+      }, required: ['title', 'content', 'category'],
     },
   },
   {
@@ -99,13 +99,8 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        strategy: {
-          type: 'string',
-          enum: ['aggressive', 'balanced', 'conservative'],
-          description: 'Ad placement strategy',
-        },
-      },
-      required: ['strategy'],
+        strategy: { type: 'string', enum: ['aggressive', 'balanced', 'conservative'], description: 'Ad placement strategy' },
+      }, required: ['strategy'],
     },
   },
   {
@@ -124,192 +119,232 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        tasks: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'Tasks to run: seo, links, performance, all',
-        },
+        tasks: { type: 'array', items: { type: 'string' }, description: 'Tasks to run: seo, links, performance, all' },
       },
     },
   },
+  {
+    name: 'get_usage_report',
+    description: '[Tenant] Get your current billing period usage summary',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'register_webhook',
+    description: '[Tenant] Register a webhook endpoint for event notifications',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Your webhook callback URL' },
+        events: { type: 'array', items: { type: 'string' }, description: 'Events to subscribe to: deployment.complete, error, usage.threshold' },
+      }, required: ['url', 'events'],
+    },
+  },
+  {
+    name: 'get_connection_script',
+    description: '[Tenant] Get a pre-configured JSON setup script to connect your local tools',
+    inputSchema: { type: 'object', properties: {} },
+  },
 ];
 
-function generateApiToken() {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let token = 'azr_sk_';
-  for (let i = 0; i < 48; i++) {
-    token += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return token;
+let server;
+
+async function initServer() {
+  server = new Server(
+    { name: 'azaria-ai-worker', version: WORKER_VERSION },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    try {
+      const result = await handleToolCall(name, args || {}, null);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }] };
+    }
+  });
+  return server;
 }
 
-async function dispatchOnboardingEmail(email, token) {
-  console.log(`[onboarding] Sending welcome package to ${email} with token ${token.slice(0, 12)}...`);
-  return { sent: true, recipient: email };
+function withTimeout(promise, ms) {
+  const timer = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`TIMEOUT: operation exceeded ${ms}ms`)), ms)
+  );
+  return Promise.race([promise, timer]);
 }
 
-async function handleToolCall(name, args, authRecord) {
+async function handleToolCall(name, args, authRecord, kv) {
   const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN || globalThis.GITHUB_TOKEN });
+
+  if (authRecord && kv) {
+    const limitCheck = await checkUsageLimit(kv, authRecord.tenant_id);
+    if (!limitCheck.allowed) {
+      throw new Error(`USAGE_LIMIT_EXCEEDED: ${limitCheck.reason}`);
+    }
+  }
 
   switch (name) {
     case 'get_site_status': {
-      const { data: repo } = await octokit.rest.repos.get({
-        owner: GITHUB_OWNER, repo: GITHUB_REPO,
-      });
-      const { data: pages } = await octokit.rest.repos.getPages({
-        owner: GITHUB_OWNER, repo: GITHUB_REPO,
-      }).catch(() => ({ data: { status: 'not_configured' } }));
+      const { data: repo } = await withTimeout(octokit.rest.repos.get({ owner: GITHUB_OWNER, repo: GITHUB_REPO }), TIMEOUT_MS);
+      const { data: pages } = await octokit.rest.repos.getPages({ owner: GITHUB_OWNER, repo: GITHUB_REPO }).catch(() => ({ data: { status: 'not_configured' } }));
       const result = {
-        repo: repo.full_name,
-        url: 'https://production.azaria-ai-frontend.pages.dev',
-        pages_status: pages.status || 'unknown',
-        last_updated: repo.updated_at,
-        stars: repo.stargazers_count,
-        forks: repo.forks_count,
+        repo: repo.full_name, url: 'https://production.azaria-ai-frontend.pages.dev',
+        pages_status: pages.status || 'unknown', last_updated: repo.updated_at,
+        stars: repo.stargazers_count, forks: repo.forks_count,
         worker: 'https://azaria-ai-worker.evansmathibe82.workers.dev',
       };
-      if (authRecord) result.subscriber = authRecord.email ? 'authenticated' : 'anonymous';
+      if (authRecord) result.tenant = authRecord.tenant?.name || 'authenticated';
       return result;
     }
     case 'deploy_site': {
-      return {
-        status: 'ready_to_deploy',
-        commit_message: args.message || 'Site update via Azaria AI Worker',
-        branch: 'main',
-        action: 'Push changes to trigger Cloudflare Pages deployment',
-      };
+      return { status: 'ready_to_deploy', commit_message: args.message || 'Site update via Azaria AI Worker', branch: 'main', action: 'Push changes to trigger Cloudflare Pages deployment' };
     }
     case 'update_adsense_id': {
-      return {
-        action: 'Update AdSense ID',
-        publisher_id: args.publisherId,
-        instructions: `Replace 'ca-pub-XXXXXXXXXXXXXX' with '${args.publisherId}' in all pages`,
-      };
+      return { action: 'Update AdSense ID', publisher_id: args.publisherId, instructions: `Replace 'ca-pub-XXXXXXXXXXXXXX' with '${args.publisherId}' in all pages` };
     }
     case 'add_article': {
       const slug = args.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+/g, '-');
-      return {
-        action: 'Create article',
-        title: args.title,
-        slug: `article-${slug}.html`,
-        category: args.category,
-        excerpt: args.excerpt || args.title,
-      };
+      return { action: 'Create article', title: args.title, slug: `article-${slug}.html`, category: args.category, excerpt: args.excerpt || args.title };
     }
     case 'optimize_ads': {
-      const strategies = {
-        aggressive: { header_banners: 3, sidebar_ads: 2, in_content_ads: 3, footer_ads: 1, total: 9 },
-        balanced: { header_banners: 1, sidebar_ads: 1, in_content_ads: 2, footer_ads: 1, total: 5 },
-        conservative: { header_banners: 1, sidebar_ads: 1, in_content_ads: 1, footer_ads: 0, total: 3 },
-      };
-      return {
-        strategy: args.strategy,
-        ad_units: strategies[args.strategy],
-        recommendation: args.strategy === 'aggressive'
-          ? 'Warning: More than 3 ads may violate AdSense policies'
-          : 'This configuration complies with AdSense policies (max 3 ads recommended)',
-      };
+      const strategies = { aggressive: { header_banners: 3, sidebar_ads: 2, in_content_ads: 3, footer_ads: 1, total: 9 }, balanced: { header_banners: 1, sidebar_ads: 1, in_content_ads: 2, footer_ads: 1, total: 5 }, conservative: { header_banners: 1, sidebar_ads: 1, in_content_ads: 1, footer_ads: 0, total: 3 } };
+      return { strategy: args.strategy, ad_units: strategies[args.strategy], recommendation: args.strategy === 'aggressive' ? 'Warning: More than 3 ads may violate AdSense policies' : 'This configuration complies with AdSense policies (max 3 ads recommended)' };
     }
     case 'check_adsense_status': {
-      return {
-        site_url: 'https://production.azaria-ai-frontend.pages.dev',
-        application_url: 'https://www.google.com/adsense/start/',
-        checklist: {
-          original_content: true,
-          privacy_policy: 'about.html or contact.html',
-          contact_information: 'contact.html',
-          ads_placeholders: 'Ready in all pages',
-          mobile_friendly: 'Responsive design',
-          navigation: 'Clear menu',
-          sitemap: 'sitemap.xml',
-          robots_txt: 'robots.txt',
-        },
-        status: 'Ready to apply',
-      };
+      return { site_url: 'https://production.azaria-ai-frontend.pages.dev', application_url: 'https://www.google.com/adsense/start/', checklist: { original_content: true, privacy_policy: 'about.html or contact.html', contact_information: 'contact.html', ads_placeholders: 'Ready in all pages', mobile_friendly: 'Responsive design', navigation: 'Clear menu', sitemap: 'sitemap.xml', robots_txt: 'robots.txt' }, status: 'Ready to apply' };
     }
     case 'update_sitemap': {
-      return {
-        action: 'Update sitemap',
-        file: 'sitemap.xml',
-        instructions: 'Add new article URLs with weekly changefreq and 0.8 priority',
-      };
+      return { action: 'Update sitemap', file: 'sitemap.xml', instructions: 'Add new article URLs with weekly changefreq and 0.8 priority' };
     }
     case 'run_maintenance': {
       const tasks = args.tasks || ['all'];
+      return { tasks_run: tasks, results: { seo: { meta_tags: 'Present', sitemap: 'Valid', robots_txt: 'Present', open_graph: 'Present' }, links: { internal_links: 'OK', external_links: 'Manual check recommended' }, performance: { css_minified: 'Yes', js_minified: 'Yes', images_lazy: 'Yes' } }, maintenance_complete: true };
+    }
+    case 'get_usage_report': {
+      if (!authRecord || !kv) throw new Error('AUTH_REQUIRED: Valid tenant token required');
+      const usage = await getUsage(kv, authRecord.tenant_id);
+      const tenant = await getTenant(kv, authRecord.tenant_id);
+      const sub = await getSubscription(kv, authRecord.tenant_id);
+      return { tenant: tenant?.name || 'Unknown', plan: tenant?.plan || 'free', period: usage.period, rpc_calls: usage.rpc_calls, tokens_used: usage.tokens_used, limits: tenant?.limits || null, subscription: sub, byok: await getBYOKs(kv, authRecord.tenant_id) };
+    }
+    case 'register_webhook': {
+      if (!authRecord || !kv) throw new Error('AUTH_REQUIRED: Valid tenant token required');
+      const integration = await createIntegration(kv, authRecord.tenant_id, { type: 'webhook', name: args.url, config: { url: args.url, events: args.events } });
+      return { status: 'registered', integration, setup_instructions: 'Send POST requests to the configured URL with JSON payloads' };
+    }
+    case 'get_connection_script': {
+      if (!authRecord) throw new Error('AUTH_REQUIRED: Valid tenant token required');
       return {
-        tasks_run: tasks,
-        results: {
-          seo: { meta_tags: 'Present', sitemap: 'Valid', robots_txt: 'Present', open_graph: 'Present' },
-          links: { internal_links: 'OK', external_links: 'Manual check recommended' },
-          performance: { css_minified: 'Yes', js_minified: 'Yes', images_lazy: 'Yes' },
-        },
-        maintenance_complete: true,
+        client: 'Azaria AI MCP Gateway',
+        version: WORKER_VERSION,
+        auth: { token: authRecord.token || 'use-your-bearer-token', header: 'Authorization: Bearer <token>' },
+        endpoints: { rpc: 'https://azaria-ai-worker.evansmathibe82.workers.dev/rpc', sse: 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse', tools: 'https://azaria-ai-worker.evansmathibe82.workers.dev/tools' },
+        setup: { goose: { transport: 'sse', url: 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse', auth: 'bearer' }, openhands: { transport: 'sse', url: 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse' }, gemini: { transport: 'sse', url: 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse' } },
+        tools: tools.map(t => ({ name: t.name, description: t.description })),
       };
     }
     case 'admin_getSystemMetrics': {
-      if (!authRecord) {
-        throw new Error('UNAUTHORIZED: Valid bearer token required for admin methods');
-      }
+      if (!authRecord) throw new Error('UNAUTHORIZED: Valid bearer token required for admin methods');
       const now = Math.floor(Date.now() / 1000);
+      const tenantList = kv ? await listTenants(kv) : [];
       return {
-        worker: {
-          version: WORKER_VERSION,
-          status: 'ONLINE_AND_ACTIVE',
-          uptime_seconds: now - 1749660000,
-          gateway_protocol: 'JSON-RPC 2.0 Over HTTPS',
-        },
-        kv: {
-          binding: 'AZARIA_KV',
-          id: 'c5e138ac78634ce4802de4171941b4a9',
-          connected: true,
-        },
-        rate_limit: {
-          algorithm: 'leaky-bucket',
-          max_per_window: TOOLS_RATE_LIMIT,
-          window_seconds: TOOLS_RATE_WINDOW,
-        },
-        tools: {
-          total: tools.length,
-          schema: tools.map(t => ({ name: t.name, description: t.description })),
-        },
-        auth: {
-          subscriber: authRecord.email ? authRecord.email.slice(0, 4) + '...' : 'authenticated',
-          subscriber_since: authRecord.created || 'unknown',
-        },
+        worker: { version: WORKER_VERSION, status: 'ONLINE_AND_ACTIVE', uptime_seconds: now - 1749660000, gateway_protocol: 'JSON-RPC 2.0 Over HTTPS' },
+        kv: { binding: 'AZARIA_KV', id: 'c5e138ac78634ce4802de4171941b4a9', connected: true },
+        rate_limit: { algorithm: 'leaky-bucket', max_per_window: TOOLS_RATE_LIMIT, window_seconds: TOOLS_RATE_WINDOW },
+        tools: { total: tools.length, schema: tools.map(t => ({ name: t.name, description: t.description, category: t.name.startsWith('admin_') ? 'admin' : t.name.startsWith('get_') || t.name.startsWith('register_') ? 'tenant' : 'system' })) },
+        auth: { subscriber: authRecord.tenant?.name || authRecord.tenant_id || 'authenticated', subscriber_since: authRecord.created || 'unknown' },
+        tenants: { total: tenantList.length, active: tenantList.filter(t => t.active).length, plans: countBy(tenantList, 'plan') },
         timestamp: new Date().toISOString(),
       };
+    }
+    case 'admin_listTenants': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      const summary = await getAllUsageSummary(kv);
+      return { tenants: summary };
+    }
+    case 'admin_getTenantDetail': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      const tenant = await getTenant(kv, args.tenantId);
+      if (!tenant) throw new Error('Tenant not found');
+      const usage = await getUsage(kv, args.tenantId);
+      const integrations = await getIntegrations(kv, args.tenantId);
+      const sub = await getSubscription(kv, args.tenantId);
+      const byoks = await getBYOKs(kv, args.tenantId);
+      return { tenant, usage, integrations, subscription: sub, byok: byoks };
+    }
+    case 'admin_createTenant': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      const result = await createTenant(kv, { name: args.name, email: args.email, plan: args.plan || 'free' });
+      return result;
+    }
+    case 'admin_updateTenantLimits': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      const updated = await updateTenantLimits(kv, args.tenantId, args.limits);
+      if (!updated) throw new Error('Tenant not found');
+      return { tenant: updated };
+    }
+    case 'admin_deactivateTenant': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      const ok = await deactivateTenant(kv, args.tenantId);
+      return { deactivated: ok };
+    }
+    case 'admin_getMeteringReport': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      const summary = await getAllUsageSummary(kv);
+      const totalRpc = summary.reduce((a, s) => a + s.usage.rpc_calls, 0);
+      const totalTokens = summary.reduce((a, s) => a + s.usage.tokens_used, 0);
+      const activeTenants = summary.filter(s => s.tenant.active).length;
+      return { report: summary, totals: { tenants: summary.length, active_tenants: activeTenants, total_rpc_calls: totalRpc, total_tokens_used: totalTokens }, generated_at: new Date().toISOString() };
+    }
+    case 'admin_createIntegration': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      const integration = await createIntegration(kv, args.tenantId, { type: args.type, name: args.name, config: args.config });
+      return { integration };
+    }
+    case 'admin_deleteIntegration': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      await deleteIntegration(kv, args.tenantId, args.integrationId);
+      return { deleted: true };
+    }
+    case 'admin_storeBYOK': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      if (!BYOK_PROVIDERS.includes(args.provider)) throw new Error(`Unsupported provider. Supported: ${BYOK_PROVIDERS.join(', ')}`);
+      const byok = await storeBYOK(kv, args.tenantId, args.provider, args.keyPrefix);
+      return { byok };
+    }
+    case 'admin_deleteBYOK': {
+      if (!authRecord) throw new Error('UNAUTHORIZED');
+      if (!kv) throw new Error('KV not available');
+      await deleteBYOK(kv, args.tenantId, args.provider);
+      return { deleted: true };
     }
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 }
 
-let server;
-
-async function initServer() {
-  server = new Server(
-    { name: 'azaria-ai-worker', version: '1.0.0' },
-    { capabilities: { tools: {} } },
-  );
-
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-    try {
-      const result = await handleToolCall(name, args || {});
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-    } catch (error) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }] };
-    }
-  });
-
-  return server;
+function countBy(arr, key) {
+  const counts = {};
+  for (const item of arr) {
+    const val = item[key] || 'unknown';
+    counts[val] = (counts[val] || 0) + 1;
+  }
+  return counts;
 }
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-BYOK-Provider, X-BYOK-Key',
 };
 
 function jsonResponse(data, status = 200) {
@@ -329,86 +364,93 @@ export default {
     }
 
     if (request.method === 'GET' && url.pathname === '/') {
+      const tenantCount = kv ? (await listTenants(kv).catch(() => [])).length : 0;
       return jsonResponse({
         status: 'ONLINE_AND_ACTIVE',
         system: 'Evans Mathibe AI Platform Engine',
         gateway_protocol: 'JSON-RPC 2.0 Over HTTPS',
+        version: WORKER_VERSION,
         timestamp: new Date().toISOString(),
-        version: '1.0.0',
-        endpoints: {
-          health: '/health',
-          compliance: '/compliance',
-          tools: '/tools',
-          rpc: '/rpc',
-          webhook: '/webhook/stripe',
-        },
+        multi_tenant: { enabled: true, tenants: tenantCount, plans: ['free', 'starter', 'professional', 'enterprise'] },
+        endpoints: { health: '/health', compliance: '/compliance', tools: '/tools', rpc: '/rpc', sse: '/sse', webhook: '/webhook/stripe' },
+        byok: { supported: true, providers: BYOK_PROVIDERS },
         worker_url: 'https://azaria-ai-worker.evansmathibe82.workers.dev',
-        frontend_url: 'https://production.azaria-ai-frontend.pages.dev',
+        frontend_url: 'https://azaria-ai-frontend.pages.dev',
         github: 'https://github.com/Evansxm/azaria-ai-agency',
       });
     }
 
     if (request.method === 'GET' && url.pathname === '/health') {
-      return jsonResponse({
-        status: 'ok',
-        service: 'azaria-ai-worker',
-        timestamp: new Date().toISOString(),
-      });
+      return jsonResponse({ status: 'ok', service: 'azaria-ai-worker', version: WORKER_VERSION, timestamp: new Date().toISOString() });
     }
 
     if (request.method === 'GET' && url.pathname === '/compliance') {
       return jsonResponse({
-        framework: 'POPIA (Protection of Personal Information Act)',
-        jurisdiction: 'Republic of South Africa',
-        data_sovereignty: {
-          principle: 'PII is hashed client-side via SHA-256 before transmission',
-          mechanism: 'Web Crypto API — crypto.subtle.digest("SHA-256", ...)',
-          storage: 'No raw PII ever stored on Cloudflare edge or backend tables',
-        },
-        hashing_algorithm: 'SHA-256',
-        contact_officer: COMPLIANCE_CONTACT_EMAIL,
+        framework: 'POPIA (Protection of Personal Information Act)', jurisdiction: 'Republic of South Africa',
+        data_sovereignty: { principle: 'PII is hashed client-side via SHA-256 before transmission', mechanism: 'Web Crypto API — crypto.subtle.digest("SHA-256", ...)', storage: 'No raw PII ever stored on Cloudflare edge or backend tables' },
+        hashing_algorithm: 'SHA-256', contact_officer: COMPLIANCE_CONTACT_EMAIL,
         redacted_fields: ['email', 'phone', 'idNumber', 'passport', 'ssn', 'creditCard'],
-        rate_limiting: {
-          endpoint: '/tools',
-          algorithm: 'leaky-bucket',
-          max_requests: TOOLS_RATE_LIMIT,
-          window_seconds: TOOLS_RATE_WINDOW,
-        },
-        authentication: {
-          rpc_endpoint: '/rpc',
-          scheme: 'Bearer token',
-          token_storage: 'SHA-256 hashed in Workers KV',
-        },
+        rate_limiting: { endpoint: '/tools', algorithm: 'leaky-bucket', max_requests: TOOLS_RATE_LIMIT, window_seconds: TOOLS_RATE_WINDOW },
+        authentication: { rpc_endpoint: '/rpc', scheme: 'Bearer token', tenants: true, byok: true },
+        multi_tenant: { isolation: 'per-tenant KV namespacing', metering: 'monthly usage buckets', limits: 'configurable per plan' },
       });
     }
 
     if (request.method === 'GET' && url.pathname === '/tools') {
       const ip = getClientIP(request);
       const ipHash = await sha256Hex(ip);
-
       let rateResult;
       if (kv) {
         rateResult = await checkRateLimit(kv, ipHash);
       } else {
         rateResult = { allowed: true, remaining: 999 };
       }
-
       if (!rateResult.allowed) {
-        return jsonResponse({
-          error: 'Rate limit exceeded',
-          retry_after_seconds: rateResult.retryAfter,
-          limit: TOOLS_RATE_LIMIT,
-          window_seconds: TOOLS_RATE_WINDOW,
-        }, 429);
+        return jsonResponse({ error: 'Rate limit exceeded', retry_after_seconds: rateResult.retryAfter, limit: TOOLS_RATE_LIMIT, window_seconds: TOOLS_RATE_WINDOW }, 429);
       }
-
       if (!server) await initServer();
       return new Response(JSON.stringify({ tools, rate_limit: { remaining: rateResult.remaining } }, null, 2), {
         status: 200,
+        headers: { 'Content-Type': 'application/json', 'X-RateLimit-Remaining': String(rateResult.remaining), 'X-RateLimit-Reset': String(Math.floor(Date.now() / 1000) + TOOLS_RATE_WINDOW), ...corsHeaders },
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/sse') {
+      const authHeader = request.headers.get('Authorization') || '';
+      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+      let authRecord = null;
+      if (token && kv) {
+        authRecord = await validateToken(kv, token);
+      }
+
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+      const encoder = new TextEncoder();
+
+      writer.write(encoder.encode(`event: connected\ndata: ${JSON.stringify({ status: 'connected', version: WORKER_VERSION, tenant: authRecord?.tenant?.name || 'anonymous', timestamp: new Date().toISOString() })}\n\n`));
+
+      const keepAlive = setInterval(() => {
+        writer.write(encoder.encode(`: keepalive\n\n`)).catch(() => {});
+      }, 15000);
+
+      ctx.waitUntil(new Promise((resolve) => {
+        const ac = new AbortController();
+        request.signal.addEventListener('abort', () => {
+          clearInterval(keepAlive);
+          writer.close().catch(() => {}).finally(resolve);
+        });
+        setTimeout(() => {
+          clearInterval(keepAlive);
+          writer.close().catch(() => {}).finally(resolve);
+        }, 300000);
+      }));
+
+      return new Response(readable, {
         headers: {
-          'Content-Type': 'application/json',
-          'X-RateLimit-Remaining': String(rateResult.remaining),
-          'X-RateLimit-Reset': String(Math.floor(Date.now() / 1000) + TOOLS_RATE_WINDOW),
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
           ...corsHeaders,
         },
       });
@@ -420,31 +462,37 @@ export default {
 
       let authRecord = null;
       if (token && kv) {
-        authRecord = await validateBearerToken(kv, token);
+        authRecord = await validateToken(kv, token);
       }
 
       if (!authRecord && token) {
         return jsonResponse({ error: 'Invalid or expired API token', code: 'UNAUTHORIZED' }, 401);
       }
 
+      const byokProvider = request.headers.get('X-BYOK-Provider') || null;
+      const byokKey = request.headers.get('X-BYOK-Key') || null;
+
       try {
         const body = await request.json();
         const { method, params } = body;
 
-        const result = await handleToolCall(method, params || {}, authRecord);
+        const result = await withTimeout(handleToolCall(method, params || {}, authRecord, kv), TIMEOUT_MS);
 
-        if (authRecord && kv) {
-          const usageKey = `usage:${await sha256Hex(token)}:${new Date().toISOString().slice(0, 10)}`;
-          const usageEntry = await kv.get(usageKey, 'json') || { count: 0 };
-          usageEntry.count += 1;
-          await kv.put(usageKey, JSON.stringify(usageEntry), { expirationTtl: 86400 * 32 });
+        if (authRecord && kv && !method.startsWith('admin_')) {
+          await recordUsage(kv, authRecord.tenant_id, { rpc_calls: 1, tokens_used: JSON.stringify(result).length });
+        }
+
+        if (byokProvider && byokKey && kv && authRecord) {
+          const existing = await getBYOKs(kv, authRecord.tenant_id);
+          if (!existing.find(b => b.provider === byokProvider)) {
+            await storeBYOK(kv, authRecord.tenant_id, byokProvider, byokKey.slice(0, 8) + '...');
+          }
         }
 
         return jsonResponse({ jsonrpc: '2.0', result, id: body.id || null });
       } catch (error) {
-        return jsonResponse({
-          jsonrpc: '2.0', error: { code: -32603, message: error.message }, id: null,
-        }, 500);
+        const code = error.message.startsWith('TIMEOUT') ? -32001 : error.message.startsWith('USAGE_LIMIT') ? -32002 : error.message.startsWith('UNAUTHORIZED') ? -32603 : -32603;
+        return jsonResponse({ jsonrpc: '2.0', error: { code, message: error.message }, id: null }, code === -32603 ? 500 : 403);
       }
     }
 
@@ -453,50 +501,28 @@ export default {
         const signature = request.headers.get('Stripe-Signature');
         const body = await request.text();
         let event;
-        try {
-          event = JSON.parse(body);
-        } catch {
-          return jsonResponse({ error: 'Invalid JSON payload' }, 400);
-        }
+        try { event = JSON.parse(body); } catch { return jsonResponse({ error: 'Invalid JSON payload' }, 400); }
 
         if (event.type === 'checkout.session.completed') {
           const session = event.data.object;
           const customerEmail = session.customer_email || session.customer_details?.email;
+          if (!customerEmail) return jsonResponse({ error: 'No customer email in session' }, 400);
 
-          if (!customerEmail) {
-            return jsonResponse({ error: 'No customer email in session' }, 400);
-          }
-
-          const emailHash = await sha256Hex(customerEmail);
-          const newToken = generateApiToken();
-          const tokenHash = await sha256Hex(newToken);
+          const planMap = { 'price_free': 'free', 'price_starter': 'starter', 'price_professional': 'professional', 'price_enterprise': 'enterprise' };
+          const plan = planMap[session.metadata?.price_id] || 'free';
 
           if (kv) {
-            const subscriberRecord = {
-              email: customerEmail,
-              emailHash,
-              plan: session.mode === 'subscription' ? 'premium' : 'one-time',
-              created: new Date().toISOString(),
-              sessionId: session.id,
-              active: true,
-            };
-
-            await kv.put(`subscriber:${emailHash}`, JSON.stringify(subscriberRecord));
-            await kv.put(`token:${tokenHash}`, JSON.stringify({
-              subscriber: emailHash,
-              created: new Date().toISOString(),
-              active: true,
-            }));
+            const result = await createTenant(kv, { name: customerEmail.split('@')[0], email: customerEmail, plan });
+            if (session.id) {
+              await createSubscription(kv, result.tenant.id, session.id, plan);
+            }
+            return jsonResponse({
+              received: true, status: 'tenant_provisioned', tenant_id: result.tenant.id,
+              token_prefix: result.token.slice(0, 12) + '...',
+              plan,
+            });
           }
-
-          ctx.waitUntil(dispatchOnboardingEmail(customerEmail, newToken));
-
-          return jsonResponse({
-            received: true,
-            status: 'onboarding_initiated',
-            email: emailHash.slice(0, 16) + '...',
-            token_prefix: newToken.slice(0, 12) + '...',
-          });
+          return jsonResponse({ received: true, type: event.type, note: 'KV not available, tenant not persisted' });
         }
 
         return jsonResponse({ received: true, type: event.type });
