@@ -2,12 +2,13 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Menu, X, Brain, Terminal, CreditCard, LayoutDashboard } from 'lucide-react';
+import { Menu, X, Brain, Terminal, CreditCard, LayoutDashboard, Shield } from 'lucide-react';
 
 const navLinks = [
   { href: '/', label: 'Home', icon: Brain },
   { href: '/services', label: 'Services', icon: Terminal },
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { href: '/admin', label: 'Admin', icon: Shield },
 ];
 
 export default function Navbar() {

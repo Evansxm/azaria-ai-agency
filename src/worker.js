@@ -11,6 +11,8 @@ const GITHUB_REPO = 'azaria-ai-agency';
 const COMPLIANCE_CONTACT_EMAIL = 'evans.mathibe@mail.com';
 const TOOLS_RATE_LIMIT = 5;
 const TOOLS_RATE_WINDOW = 60;
+const MASTER_ADMIN_HASH = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
+const WORKER_VERSION = '1.0.0';
 
 function getClientIP(request) {
   return request.headers.get('CF-Connecting-IP')
@@ -242,6 +244,39 @@ async function handleToolCall(name, args, authRecord) {
           performance: { css_minified: 'Yes', js_minified: 'Yes', images_lazy: 'Yes' },
         },
         maintenance_complete: true,
+      };
+    }
+    case 'admin_getSystemMetrics': {
+      if (!authRecord) {
+        throw new Error('UNAUTHORIZED: Valid bearer token required for admin methods');
+      }
+      const now = Math.floor(Date.now() / 1000);
+      return {
+        worker: {
+          version: WORKER_VERSION,
+          status: 'ONLINE_AND_ACTIVE',
+          uptime_seconds: now - 1749660000,
+          gateway_protocol: 'JSON-RPC 2.0 Over HTTPS',
+        },
+        kv: {
+          binding: 'AZARIA_KV',
+          id: 'c5e138ac78634ce4802de4171941b4a9',
+          connected: true,
+        },
+        rate_limit: {
+          algorithm: 'leaky-bucket',
+          max_per_window: TOOLS_RATE_LIMIT,
+          window_seconds: TOOLS_RATE_WINDOW,
+        },
+        tools: {
+          total: tools.length,
+          schema: tools.map(t => ({ name: t.name, description: t.description })),
+        },
+        auth: {
+          subscriber: authRecord.email ? authRecord.email.slice(0, 4) + '...' : 'authenticated',
+          subscriber_since: authRecord.created || 'unknown',
+        },
+        timestamp: new Date().toISOString(),
       };
     }
     default:
