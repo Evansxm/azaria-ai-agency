@@ -145,14 +145,16 @@ function SkillToggle({ name, description, enabled, onToggle, category }) {
 }
 
 function LocalAgentCard({ name, status, icon: Icon, detail }) {
+  const statusMap = { configured: 'live', unconfigured: 'idle', custom: 'warning', connected: 'live', disconnected: 'idle', connecting: 'warning' };
+  const colorMap = { configured: 'var(--color-success)', unconfigured: 'var(--color-text-muted)', custom: 'var(--color-accent)', connected: 'var(--color-success)', disconnected: 'var(--color-text-muted)', connecting: 'var(--color-warning)' };
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', padding: 'var(--space-3) var(--space-4)', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg-elevated)', border: `1px solid ${status === 'connected' ? 'rgba(0,214,143,0.2)' : 'var(--color-border)'}` }}>
-      <Icon size={20} color={status === 'connected' ? 'var(--color-success)' : 'var(--color-text-muted)'} />
+    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', padding: 'var(--space-3) var(--space-4)', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg-elevated)', border: `1px solid ${status === 'configured' || status === 'connected' ? 'rgba(0,214,143,0.2)' : status === 'custom' ? 'rgba(108,92,231,0.2)' : 'var(--color-border)'}` }}>
+      <Icon size={20} color={colorMap[status] || 'var(--color-text-muted)'} />
       <div style={{ flex: 1 }}>
         <div style={{ fontWeight: 600, fontSize: '0.85rem' }}>{name}</div>
         <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>{detail}</div>
       </div>
-      <StatusBadge status={status === 'connected' ? 'live' : 'idle'} label={status} pulsing={status === 'connecting'} />
+      <StatusBadge status={statusMap[status] || 'idle'} label={status} pulsing={status === 'connecting'} />
     </div>
   );
 }
@@ -170,10 +172,16 @@ export default function AdminWorkerDashboard({ token }) {
   const [tenantDetail, setTenantDetail] = useState(null);
   const [connectionScript, setConnectionScript] = useState(null);
   const [copied, setCopied] = useState(false);
-  const [sseStatus, setSseStatus] = useState('disconnected');
+  const [sseStatus, setSseStatus] = useState('connecting');
   const [skills, setSkills] = useState({});
   const [createdToken, setCreatedToken] = useState(null);
+  const [toolStatuses, setToolStatuses] = useState({});
+  const [customConnectors, setCustomConnectors] = useState([]);
+  const [showAddConnector, setShowAddConnector] = useState(false);
+  const [newConnector, setNewConnector] = useState({ name: '', type: 'sse', url: '', headers: '' });
   const pollRef = useRef(null);
+  const sseRef = useRef(null);
+  const reconnectRef = useRef(null);
 
   const refresh = useCallback(async () => {
     if (!token) return;
@@ -205,13 +213,41 @@ export default function AdminWorkerDashboard({ token }) {
     return () => clearInterval(pollRef.current);
   }, [refresh]);
   useEffect(() => {
-    const es = new EventSource(`https://azaria-ai-worker.evansmathibe82.workers.dev/sse?health=1`);
-    es.onopen = () => setSseStatus('connected');
-    es.onerror = () => setSseStatus('disconnected');
-    es.onmessage = () => setSseStatus('connected');
-    const timeout = setTimeout(() => { if (sseStatus === 'disconnected') setSseStatus('disconnected'); }, 5000);
-    return () => { es.close(); clearTimeout(timeout); };
+    let mounted = true;
+    function connectSSE() {
+      if (!mounted) return;
+      const es = new EventSource(`https://azaria-ai-worker.evansmathibe82.workers.dev/sse?health=1`);
+      sseRef.current = es;
+      es.onopen = () => { if (mounted) setSseStatus('connected'); };
+      es.onerror = () => {
+        if (!mounted) return;
+        setSseStatus('disconnected');
+        es.close();
+        sseRef.current = null;
+        clearTimeout(reconnectRef.current);
+        reconnectRef.current = setTimeout(connectSSE, 3000);
+      };
+      es.onmessage = () => { if (mounted) setSseStatus('connected'); };
+    }
+    connectSSE();
+    return () => {
+      mounted = false;
+      clearTimeout(reconnectRef.current);
+      if (sseRef.current) sseRef.current.close();
+    };
   }, []);
+  useEffect(() => {
+    if (connectionScript?.configs) {
+      const statuses = {};
+      for (const name of Object.keys(connectionScript.configs)) {
+        statuses[name] = 'configured';
+      }
+      for (const c of customConnectors) {
+        statuses[c.name] = 'custom';
+      }
+      setToolStatuses(statuses);
+    }
+  }, [connectionScript, customConnectors]);
 
   if (!token) {
     return (
@@ -257,6 +293,23 @@ export default function AdminWorkerDashboard({ token }) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
+  };
+
+  const addCustomConnector = () => {
+    if (!newConnector.name || !newConnector.url) return;
+    const connector = {
+      name: newConnector.name.replace(/[^a-z0-9_-]/gi, '_').toLowerCase(),
+      type: newConnector.type,
+      url: newConnector.url,
+      headers: newConnector.headers ? JSON.parse(newConnector.headers.replace(/'/g, '"').replace(/(\w+):/g, '"$1":') || '{}') : {},
+    };
+    setCustomConnectors(prev => [...prev, connector]);
+    setNewConnector({ name: '', type: 'sse', url: '', headers: '' });
+    setShowAddConnector(false);
+  };
+
+  const removeCustomConnector = (name) => {
+    setCustomConnectors(prev => prev.filter(c => c.name !== name));
   };
 
   const MetricRow = ({ label, value, sub, color }) => (
@@ -338,12 +391,46 @@ export default function AdminWorkerDashboard({ token }) {
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 'var(--space-4)' }}>
-        <ModuleCard title="Local Integration Terminal" icon={Plug} accent="var(--color-info)">
+        <ModuleCard title="Local Integration Terminal" icon={Plug} accent="var(--color-info)" actions={
+          <button onClick={() => setShowAddConnector(!showAddConnector)} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '6px 12px', borderRadius: 'var(--radius-sm)', background: showAddConnector ? 'var(--color-bg-elevated)' : 'var(--color-accent)', color: showAddConnector ? 'var(--color-text-secondary)' : 'white', border: '1px solid var(--color-border)', fontWeight: 600, fontSize: '0.75rem', cursor: 'pointer' }}>
+            <Plus size={14} />{showAddConnector ? 'Cancel' : 'Add Connector'}
+          </button>
+        }>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
-            <LocalAgentCard name="Goose AI" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Cpu} detail="SSE transport · MCP protocol · 30s timeout" />
-            <LocalAgentCard name="OpenCode" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Terminal} detail="SSE transport · MCP protocol · 30s timeout" />
-            <LocalAgentCard name="Gemini CLI" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Globe} detail="SSE transport · JSON-RPC mapping · 30s timeout" />
-            <LocalAgentCard name="Open Design" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Grid} detail="SSE transport · MCP protocol · local-first design" />
+            {connectionScript?.configs && Object.entries({
+              goose: { name: 'Goose AI', info: '~/.config/goose/config.yaml', icon: Cpu },
+              opencode: { name: 'OpenCode', info: '~/.config/opencode/opencode.json', icon: Terminal },
+              gemini: { name: 'Gemini CLI', info: '~/.config/gemini-cli/mcp-config.json', icon: Globe },
+              open_design: { name: 'Open Design', info: '~/.open-design/agents.local.json', icon: Grid },
+            }).map(([key, t]) => (
+              <LocalAgentCard key={key} name={t.name} status={toolStatuses[key] || 'unconfigured'} icon={t.icon} detail={t.info} />
+            ))}
+            {customConnectors.map(c => (
+              <div key={c.name} style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', padding: 'var(--space-3) var(--space-4)', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)' }}>
+                <Plug size={20} color="var(--color-accent)" />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: '0.85rem' }}>{c.name}</div>
+                  <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>{c.type.toUpperCase()} · {c.url}</div>
+                </div>
+                <StatusBadge status="idle" label="custom" />
+                <button onClick={() => removeCustomConnector(c.name)} style={{ padding: 4, background: 'none', border: 'none', color: 'var(--color-text-muted)', cursor: 'pointer' }}><X size={14} /></button>
+              </div>
+            ))}
+            <AnimatePresence>
+              {showAddConnector && (
+                <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)', padding: 'var(--space-3)', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg-card)', border: '1px solid var(--color-border)' }}>
+                  <input value={newConnector.name} onChange={e => setNewConnector(p => ({ ...p, name: e.target.value }))} placeholder="Connector name (e.g. my-custom-ai)" style={{ fontSize: '0.8rem' }} />
+                  <select value={newConnector.type} onChange={e => setNewConnector(p => ({ ...p, type: e.target.value }))} style={{ fontSize: '0.8rem', padding: '10px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--color-border)', background: 'var(--color-bg-card)', color: 'var(--color-text-primary)' }}>
+                    <option value="sse">SSE (Server-Sent Events)</option>
+                    <option value="stdio">STDIO (subprocess)</option>
+                    <option value="websocket">WebSocket</option>
+                  </select>
+                  <input value={newConnector.url} onChange={e => setNewConnector(p => ({ ...p, url: e.target.value }))} placeholder={newConnector.type === 'stdio' ? 'Command (e.g. npx @modelcontextprotocol/server-filesystem /path)' : 'URL (e.g. https://example.com/sse)'} style={{ fontSize: '0.8rem' }} />
+                  <input value={newConnector.headers} onChange={e => setNewConnector(p => ({ ...p, headers: e.target.value }))} placeholder='Headers JSON (optional): {"Authorization": "Bearer token"}' style={{ fontSize: '0.8rem' }} />
+                  <button onClick={addCustomConnector} disabled={!newConnector.name || !newConnector.url} style={{ padding: '10px 16px', borderRadius: 'var(--radius-sm)', background: !newConnector.name || !newConnector.url ? 'var(--color-bg-elevated)' : 'var(--color-accent)', color: !newConnector.name || !newConnector.url ? 'var(--color-text-muted)' : 'white', border: '1px solid var(--color-border)', fontWeight: 600, fontSize: '0.8rem', cursor: !newConnector.name || !newConnector.url ? 'not-allowed' : 'pointer' }}>Add Connector</button>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
           <div style={{ display: 'flex', gap: 'var(--space-2)', paddingTop: 'var(--space-2)' }}>
             <div style={{ flex: 1, padding: 'var(--space-2) var(--space-3)', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg-elevated)', fontSize: '0.7rem', color: 'var(--color-text-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
