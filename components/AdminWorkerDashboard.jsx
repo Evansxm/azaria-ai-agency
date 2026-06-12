@@ -341,8 +341,9 @@ export default function AdminWorkerDashboard({ token }) {
         <ModuleCard title="Local Integration Terminal" icon={Plug} accent="var(--color-info)">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
             <LocalAgentCard name="Goose AI" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Cpu} detail="SSE transport · MCP protocol · 30s timeout" />
-            <LocalAgentCard name="OpenHands" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Globe} detail="SSE transport · MCP protocol · 30s timeout" />
-            <LocalAgentCard name="Gemini CLI" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Terminal} detail="SSE transport · JSON-RPC mapping · 30s timeout" />
+            <LocalAgentCard name="OpenCode" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Terminal} detail="SSE transport · MCP protocol · 30s timeout" />
+            <LocalAgentCard name="Gemini CLI" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Globe} detail="SSE transport · JSON-RPC mapping · 30s timeout" />
+            <LocalAgentCard name="Open Design" status={sseStatus === 'connected' ? 'connected' : 'disconnected'} icon={Grid} detail="SSE transport · MCP protocol · local-first design" />
           </div>
           <div style={{ display: 'flex', gap: 'var(--space-2)', paddingTop: 'var(--space-2)' }}>
             <div style={{ flex: 1, padding: 'var(--space-2) var(--space-3)', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg-elevated)', fontSize: '0.7rem', color: 'var(--color-text-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -362,9 +363,24 @@ export default function AdminWorkerDashboard({ token }) {
           <div style={{ fontSize: '0.78rem', color: 'var(--color-text-secondary)', lineHeight: 1.5 }}>
             Share this setup script with tenants to connect their local tools to the Azaria AI edge gateway.
           </div>
-          <pre style={{ margin: 0, padding: 'var(--space-3)', borderRadius: 'var(--radius-sm)', background: '#06060a', fontSize: '0.65rem', lineHeight: 1.5, overflowX: 'auto', whiteSpace: 'pre', maxHeight: 240, color: 'var(--color-text-secondary)' }}>
-{connectionScript ? JSON.stringify(connectionScript, null, 2) : '// Loading connection script...\n// Ensure you have a valid tenant token'}
-          </pre>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)', maxHeight: 300, overflowY: 'auto' }}>
+            {connectionScript && connectionScript.configs ? Object.entries(connectionScript.configs).map(([name, cfg]) => (
+              <div key={name} style={{ padding: 'var(--space-2) var(--space-3)', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-1)' }}>
+                  <span style={{ fontWeight: 600, fontSize: '0.8rem', textTransform: 'capitalize' }}>{name.replace(/_/g, ' ')}</span>
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <span style={{ fontSize: '0.65rem', padding: '2px 8px', borderRadius: 8, background: 'var(--color-bg-card)', color: 'var(--color-text-muted)' }}>{cfg.type}</span>
+                    <button onClick={() => { navigator.clipboard.writeText(cfg.type === 'json' ? JSON.stringify(cfg.snippet, null, 2) : cfg.snippet); }} style={{ padding: 4, background: 'none', border: 'none', color: 'var(--color-text-muted)', cursor: 'pointer' }}><Copy size={12} /></button>
+                  </div>
+                </div>
+                <div style={{ fontSize: '0.68rem', color: 'var(--color-text-muted)', marginBottom: 'var(--space-1)' }}>{cfg.file || cfg.command}</div>
+                <pre style={{ margin: 0, padding: 'var(--space-2)', borderRadius: 'var(--radius-sm)', background: '#06060a', fontSize: '0.6rem', lineHeight: 1.4, overflowX: 'auto', maxHeight: 80, color: 'var(--color-text-secondary)' }}>
+                  {cfg.type === 'json' ? JSON.stringify(cfg.snippet, null, 2) : cfg.snippet}
+                </pre>
+                <div style={{ fontSize: '0.65rem', color: 'var(--color-text-muted)', marginTop: 'var(--space-1)' }}>{cfg.instructions}</div>
+              </div>
+            )) : <div style={{ padding: 'var(--space-4)', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: '0.78rem' }}>Enter a valid admin token to see connection configs for each tool.</div>}
+          </div>
           <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap', paddingTop: 'var(--space-2)' }}>
             {BYOK_PROVIDERS.map(p => (
               <span key={p} style={{ fontSize: '0.65rem', padding: '4px 10px', borderRadius: 8, background: 'rgba(108,92,231,0.08)', color: 'var(--color-accent)', border: '1px solid rgba(108,92,231,0.15)' }}>{p}</span>

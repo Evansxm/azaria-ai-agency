@@ -234,13 +234,56 @@ async function handleToolCall(name, args, authRecord, kv) {
     }
     case 'get_connection_script': {
       if (!authRecord) throw new Error('AUTH_REQUIRED: Valid tenant token required');
+      const token = authRecord.token || 'azr_sk_***';
+      const sseUrl = 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse';
+      const rpcUrl = 'https://azaria-ai-worker.evansmathibe82.workers.dev/rpc';
+      const toolsUrl = 'https://azaria-ai-worker.evansmathibe82.workers.dev/tools';
       return {
         client: 'Azaria AI MCP Gateway',
         version: WORKER_VERSION,
-        auth: { token: authRecord.token || 'use-your-bearer-token', header: 'Authorization: Bearer <token>' },
-        endpoints: { rpc: 'https://azaria-ai-worker.evansmathibe82.workers.dev/rpc', sse: 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse', tools: 'https://azaria-ai-worker.evansmathibe82.workers.dev/tools' },
-        setup: { goose: { transport: 'sse', url: 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse', auth: 'bearer' }, openhands: { transport: 'sse', url: 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse' }, gemini: { transport: 'sse', url: 'https://azaria-ai-worker.evansmathibe82.workers.dev/sse' } },
+        auth: { token, header: 'Authorization: Bearer <token>' },
+        endpoints: { rpc: rpcUrl, sse: sseUrl, tools: toolsUrl },
         tools: tools.map(t => ({ name: t.name, description: t.description })),
+        configs: {
+          opencode: {
+            type: 'json',
+            file: '~/.config/opencode/opencode.json',
+            snippet: {
+              mcp: {
+                'azaria-ai': { type: 'remote', url: sseUrl, headers: { Authorization: `Bearer ${token}` }, enabled: true },
+              },
+            },
+            instructions: 'Add this to the "mcp" object in opencode.json',
+          },
+          goose: {
+            type: 'yaml',
+            file: '~/.config/goose/config.yaml',
+            snippet: `extensions:\n  azaria-ai:\n    name: azaria-ai\n    type: sse\n    url: ${sseUrl}\n    headers:\n      Authorization: Bearer ${token}\n    enabled: true`,
+            instructions: 'Add the azaria-ai block under the extensions: section',
+          },
+          gemini: {
+            type: 'cli',
+            command: `gemini mcp add azaria-ai ${sseUrl}`,
+            instructions: 'Run this command to add Azaria AI as a Gemini CLI MCP server',
+          },
+          open_design: {
+            type: 'json',
+            file: '~/.open-design/agents.local.json',
+            snippet: {
+              agents: [
+                {
+                  name: 'azaria-ai',
+                  type: 'mcp',
+                  transport: 'sse',
+                  url: sseUrl,
+                  headers: { Authorization: `Bearer ${token}` },
+                  enabled: true,
+                },
+              ],
+            },
+            instructions: 'Add the azaria-ai agent to the agents array',
+          },
+        },
       };
     }
     case 'admin_getSystemMetrics': {
