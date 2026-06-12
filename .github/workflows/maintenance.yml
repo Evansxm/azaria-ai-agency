@@ -1,8 +1,8 @@
-name: BuzzNewz Maintenance
+name: Azaria AI Maintenance
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Daily at 6 AM
+    - cron: '0 6 * * *'
   workflow_dispatch:
   push:
     branches: [main]
@@ -14,43 +14,57 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build for output checks
+        env:
+          NODE_OPTIONS: "--max-old-space-size=3072"
+        run: npm run build
+
       - name: SEO Check
         run: |
           echo "Running SEO checks..."
-          echo "- Checking sitemap.xml exists"
-          ls -la sitemap.xml
-          echo "- Checking robots.txt exists"
-          ls -la robots.txt
-          echo "- Checking meta tags in HTML files"
-          grep -l 'meta name="description"' *.html | wc -l
-
-      - name: AdSense Compliance Check
-        run: |
-          echo "Checking AdSense placeholders..."
-          grep -l 'adsbygoogle' *.html | wc -l
-          echo "All pages have AdSense code"
+          echo "- Checking public/sitemap.xml exists"
+          ls -la public/sitemap.xml
+          echo "- Checking public/robots.txt exists"
+          ls -la public/robots.txt
+          echo "- Checking meta tags in built HTML files"
+          grep -l 'meta name="description"' out/*.html 2>/dev/null | wc -l
+          echo "- Checking meta viewport in built HTML files"
+          grep -l 'meta name="viewport"' out/*.html 2>/dev/null | wc -l
 
       - name: Link Check
         run: |
-          echo "Checking internal links..."
-          grep -oh 'href="[^"]*\.html"' *.html | sort -u | head -20
+          echo "Checking internal links in built output..."
+          grep -oh 'href="[^"]*\.html"' out/*.html 2>/dev/null | sort -u | head -20
+          echo "Page count:"
+          ls out/*.html 2>/dev/null | wc -l
 
       - name: Performance Check
         run: |
-          echo "Checking file sizes..."
-          du -sh *.html
-          echo "Checking CSS/JS exists"
-          ls -la css/ js/
+          echo "Checking built file sizes..."
+          du -sh out/*.html
+          echo "Checking JS bundle sizes..."
+          du -sh out/_next/static/chunks/ 2>/dev/null
+          echo "Checking CSS..."
+          ls -la out/_next/static/css/ 2>/dev/null
 
       - name: Update Sitemap Date
         if: github.event_name == 'schedule'
         run: |
           echo "Updating sitemap lastmod dates..."
           date_str=$(date +%Y-%m-%d)
-          sed -i "s/<lastmod>[0-9-]*<\/lastmod>/<lastmod>$date_str<\/lastmod>/g" sitemap.xml
+          sed -i "s/<lastmod>[0-9-]*<\/lastmod>/<lastmod>$date_str<\/lastmod>/g" public/sitemap.xml
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add sitemap.xml
+          git add public/sitemap.xml
           git diff --quiet || git commit -m "Update sitemap dates - automated maintenance"
           git push
 
@@ -60,8 +74,8 @@ jobs:
     steps:
       - name: Success Notification
         if: success()
-        run: echo "✅ BuzzNewz maintenance completed successfully"
+        run: echo "✅ Azaria AI maintenance completed successfully"
 
       - name: Failure Notification
         if: failure()
-        run: echo "❌ BuzzNewz maintenance failed - check logs"
+        run: echo "❌ Azaria AI maintenance failed - check logs"

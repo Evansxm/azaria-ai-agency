@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://production.azaria-ai-frontend.pages.dev/sitemap.xml
